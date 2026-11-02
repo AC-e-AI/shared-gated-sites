@@ -8,6 +8,72 @@ import unittest
 import yaml
 
 SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+IMAGE_REFERENCE = re.compile(r"[^@\s]+@sha256:[a-fA-F0-9]{64}")
+
+
+# GitHub's workflow-syntax permission scopes, reviewed on 2026-11-02.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions
+PERMISSION_LEVELS = {
+    scope: {"read", "write", "none"}
+    for scope in (
+        "actions", "artifact-metadata", "attestations", "checks", "code-quality",
+        "contents", "deployments", "discussions", "issues", "packages", "pages",
+        "pull-requests", "security-events", "statuses",
+    )
+}
+PERMISSION_LEVELS.update({
+    "copilot-requests": {"write", "none"},
+    "id-token": {"write", "none"},
+    "models": {"read", "none"},
+    "vulnerability-alerts": {"read", "none"},
+})
+
+
+def permission_errors(value: object, location: str) -> list[str]:
+    if value == "read-all":
+        return []
+    if value == "write-all":
+        return [f"{location}: replace write-all with named permissions"]
+    if not isinstance(value, dict):
+        return [f"{location}: declare explicit permissions as read-all or a mapping"]
+    errors = []
+    for scope, level in value.items():
+        if not isinstance(scope, str) or scope not in PERMISSION_LEVELS:
+            errors.append(f"{location}: invalid permission scope")
+        elif not isinstance(level, str) or level not in PERMISSION_LEVELS[scope]:
+            errors.append(f"{location}: invalid permission level")
+    return errors
+
+
+def container_errors(job: dict, location: str) -> list[str]:
+    """Validate job and service images independently of action references."""
+    errors = []
+
+    def check_image(image: object, image_location: str) -> None:
+        if not isinstance(image, str) or not IMAGE_REFERENCE.fullmatch(image):
+            errors.append(f"{image_location}: pin container image to a full SHA-256 digest")
+
+    if "container" in job:
+        container = job["container"]
+        if isinstance(container, dict):
+            check_image(container.get("image"), f"{location}: container")
+        elif isinstance(container, str):
+            check_image(container, f"{location}: container")
+        else:
+            errors.append(f"{location}: container must be an image string or mapping")
+    if "services" in job:
+        services = job["services"]
+        if not isinstance(services, dict):
+            errors.append(f"{location}: services must be a mapping of image configurations")
+        else:
+            for service_name, service in services.items():
+                service_location = f"{location}: service {service_name}"
+                if not isinstance(service, dict):
+                    errors.append(f"{service_location}: service must be an image configuration mapping")
+                else:
+                    check_image(service.get("image"), service_location)
+    return errors
+
 
 
 def workflow_errors(text, name):
@@ -20,6 +86,8 @@ def workflow_errors(text, name):
         return [f'{name}: expected a workflow mapping']
     if 'permissions' not in document:
         errors.append(f"{name}: declare workflow permissions explicitly")
+    else:
+        errors.extend(permission_errors(document['permissions'], name))
     jobs = document.get('jobs') or {}
     if not isinstance(jobs, dict):
         return errors + [f'{name}: expected a jobs mapping']
@@ -28,8 +96,11 @@ def workflow_errors(text, name):
         if not isinstance(job, dict):
             errors.append(f'{name}: expected a job mapping')
             continue
-        if job.get('secrets') == 'inherit':
+        if 'permissions' in job:
+            errors.extend(permission_errors(job['permissions'], name + ': job'))
+        if 'secrets' in job and not isinstance(job['secrets'], dict):
             errors.append(f'{name}: pass reusable-workflow secrets explicitly')
+        errors.extend(container_errors(job, name + ': job'))
         if 'uses' in job:
             uses.append(job['uses'])
         for step in job.get('steps') or []:
@@ -119,6 +190,95 @@ class GuardTests(unittest.TestCase):
 
     def test_quoted_pinned_action_is_allowed(self):
         self.assertEqual(workflow_errors(self.workflow('- "uses": actions/checkout@'+'a'*40), 'ci.yml'), [])
+
+
+    def test_folded_and_literal_secret_forwarding_is_denied(self):
+        for style in ['>', '|', '>-', '|-']:
+            with self.subTest(style=style):
+                source = ('permissions: read-all\njobs:\n  ci:\n    uses: owner/repo/.github/workflows/ci.yml@'
+                          + 'a' * 40 + '\n    secrets: ' + style + '\n      inherit\n')
+                self.assertTrue(any('secrets explicitly' in error for error in workflow_errors(source, 'ci.yml')))
+
+    def test_explicit_secret_mapping_is_allowed(self):
+        source = ('permissions: read-all\njobs:\n  ci:\n    uses: owner/repo/.github/workflows/ci.yml@'
+                  + 'a' * 40 + '\n    secrets: {token: "${{ secrets.TOKEN }}"}\n')
+        self.assertEqual(workflow_errors(source, 'ci.yml'), [])
+
+    @staticmethod
+    def permission_workflow(value, job_level=False):
+        document = {'permissions': 'read-all', 'jobs': {'check': {
+            'runs-on': 'ubuntu-latest', 'steps': [{'uses': 'actions/checkout@' + 'a' * 40}]
+        }}}
+        if job_level:
+            document['jobs']['check']['permissions'] = value
+        else:
+            document['permissions'] = value
+        return yaml.safe_dump(document)
+
+    def test_invalid_workflow_permissions_are_denied(self):
+        for value in ['write-all', 'admin', None, True, 42, [],
+                      {'contents': 'admin'}, {'contents': True}, {'unknown-scope': 'read'},
+                      {'id-token': 'read'}, {'models': 'write'},
+                      {'copilot-requests': 'read'}, {'vulnerability-alerts': 'write'}]:
+            with self.subTest(value=value):
+                errors = workflow_errors(self.permission_workflow(value), 'ci.yml')
+                self.assertTrue(any('permission' in error for error in errors))
+
+    def test_invalid_job_permissions_are_denied(self):
+        for value in ['write-all', 'admin', None, True, 42, [],
+                      {'contents': 'admin'}, {'contents': True}, {'unknown-scope': 'read'},
+                      {'id-token': 'read'}, {'models': 'write'},
+                      {'copilot-requests': 'read'}, {'vulnerability-alerts': 'write'}]:
+            with self.subTest(value=value):
+                errors = workflow_errors(self.permission_workflow(value, job_level=True), 'ci.yml')
+                self.assertTrue(any('permission' in error for error in errors))
+
+    def test_explicit_scoped_permissions_are_allowed_at_both_levels(self):
+        for value in ['read-all', {}, {'contents': 'read'},
+                      {'contents': 'write', 'id-token': 'write', 'pages': 'write'},
+                      {'actions': 'none', 'models': 'read', 'vulnerability-alerts': 'read',
+                       'copilot-requests': 'write', 'artifact-metadata': 'read', 'code-quality': 'write'}]:
+            for job_level in [False, True]:
+                with self.subTest(value=value, job_level=job_level):
+                    self.assertEqual(workflow_errors(self.permission_workflow(value, job_level), 'ci.yml'), [])
+
+    def test_job_permissions_may_inherit_explicit_workflow_permissions(self):
+        self.assertEqual(workflow_errors(self.workflow('- run: echo safe'), 'ci.yml'), [])
+
+
+    def test_job_and_service_images_require_immutable_digests(self):
+        declarations = (
+            'container: ubuntu:latest',
+            'container: {image: ubuntu:latest}',
+            '"container": {"image": ubuntu:latest}',
+            '"conta\\x69ner": {image: ubuntu:latest}',
+            'services: {cache: {image: redis:7}}',
+            '"services": {"database": {"image": postgres:16}}',
+            '"serv\\x69ces": {cache: {"im\\x61ge": redis:7}}',
+        )
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                source = self.workflow('- run: echo ok').replace('    steps:', '    ' + declaration + '\n    steps:')
+                self.assertTrue(any('SHA-256 digest' in error for error in workflow_errors(source, 'ci.yml')))
+                for mutable in ('ubuntu:latest', 'redis:7', 'postgres:16'):
+                    source = source.replace(mutable, mutable.split(':')[0] + '@sha256:' + 'b' * 64)
+                self.assertEqual(workflow_errors(source, 'ci.yml'), [])
+
+
+    def test_invalid_container_and_service_shapes_fail_closed(self):
+        declarations = (
+            'container: null', 'container: []', 'container: {}',
+            'container: {image: null}', 'container: {image: true}',
+            'services: null', 'services: []', 'services: {cache: null}',
+            'services: {cache: redis:7}', 'services: {cache: {}}',
+            'services: {cache: {image: null}}',
+        )
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                source = self.workflow('- run: echo ok').replace('    steps:', '    ' + declaration + '\n    steps:')
+                self.assertTrue(workflow_errors(source, 'ci.yml'))
+        source = self.workflow('- run: echo ok').replace('    steps:', '    services: {}\n    steps:')
+        self.assertEqual(workflow_errors(source, 'ci.yml'), [])
 
 
 if __name__ == '__main__':
