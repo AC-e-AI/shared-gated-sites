@@ -1,0 +1,9 @@
+{
+  "repository": "AC-e-AI/shared-gated-sites",
+  "maintainer": "AC-e-AI",
+  "lifecycle": "active",
+  "visibility": "public",
+  "policy_scope": "personal repository; compared with Axelera governance baseline",
+  "review_model": "single-maintainer with enforced automated checks",
+  "certification_status": "not assessed; repository controls alone do not establish certification"
+}

@@ -1,0 +1,40 @@
+name: Repository governance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    name: Repository policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify the policy guard's denied and allowed cases
+        run: |
+          python3 -m venv "$RUNNER_TEMP/repository-policy"
+          "$RUNNER_TEMP/repository-policy/bin/pip" install --disable-pip-version-check --only-binary=:all: --require-hashes -r .github/policy-requirements.txt
+          "$RUNNER_TEMP/repository-policy/bin/python" .github/scripts/check-repository-policy.py --self-test
+      - name: Check repository policy
+        run: '"$RUNNER_TEMP/repository-policy/bin/python" .github/scripts/check-repository-policy.py'
+      - name: Install checksum-verified secret scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --status
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan checked-out source for secrets
+        shell: bash
+        run: '"$RUNNER_TEMP/gitleaks" dir . --redact --no-banner --no-color --max-target-megabytes 20'
